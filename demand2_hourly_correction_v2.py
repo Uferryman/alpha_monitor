@@ -971,7 +971,7 @@ def main():
 
 
         # ====================================================
-        # A. 钱包校正
+        # A. 钱包校正（滚动FIRST模式：禁止改写正式钱包状态）
         #
         # corrected_first里存在的Token+Wallet：
         #
@@ -986,7 +986,7 @@ def main():
             token_key,
             wallet,
         ), first_time in (
-            corrected_first.items()
+            ()
         ):
 
             conn.execute(
@@ -1053,7 +1053,7 @@ def main():
         for (
             token_key,
             wallet,
-        ) in removed_keys:
+        ) in ():
 
             existing = conn.execute(
                 """

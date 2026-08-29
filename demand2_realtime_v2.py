@@ -81,6 +81,7 @@ query Demand2Interval(
       }
       Block {
         first_buy_time: Time(minimum: Block_Time)
+        last_buy_time: Time(maximum: Block_Time)
       }
     }
 
@@ -778,6 +779,35 @@ def finalize_day(
 
 
     # ========================================================
+    # ========================================================
+    # 每天一次：first 详情和 last 状态最多保留30天。
+    # ========================================================
+    finalized_end = (
+        datetime.fromisoformat(date_text)
+        .replace(tzinfo=timezone.utc)
+        + timedelta(days=1)
+    )
+
+    wallet_cutoff = to_iso(
+        finalized_end - timedelta(days=30)
+    )
+
+    conn.execute(
+        """
+        DELETE FROM wallet_token_first_buy_v2
+        WHERE first_buy_time < ?
+        """,
+        (wallet_cutoff,),
+    )
+
+    conn.execute(
+        """
+        DELETE FROM wallet_token_state
+        WHERE last_buy_time < ?
+        """,
+        (wallet_cutoff,),
+    )
+
     # 保存最后完成的UTC自然日
     # ========================================================
 
@@ -810,8 +840,10 @@ def save_interval(
     date_text = start.date().isoformat()
     updated_at = to_iso(utc_now())
 
-    # 先整理first-buy。
-    first_values = []
+    # 先整理本区间每个 Token + Wallet 的最早/最后买入时间。
+    # first_buy_time：本区间第一笔 Buy。
+    # last_buy_time ：本区间最后一笔 Buy。
+    wallet_values = []
 
     for row in first_rows:
         token_id = str(
@@ -838,15 +870,26 @@ def save_interval(
             .get("first_buy_time")
         )
 
-        if wallet and first_buy_time:
-            first_values.append(
-                (
-                    token_key,
-                    wallet,
-                    first_buy_time,
-                    updated_at,
-                )
+        last_buy_time = (
+            row.get("Block", {})
+            .get("last_buy_time")
+        )
+
+        if not wallet or not first_buy_time:
+            continue
+
+        if not last_buy_time:
+            last_buy_time = first_buy_time
+
+        wallet_values.append(
+            (
+                token_key,
+                wallet,
+                first_buy_time,
+                last_buy_time,
+                updated_at,
             )
+        )
 
     # 再整理资金。
     flow_values = []
@@ -908,7 +951,6 @@ def save_interval(
 
 
     recent_first_values = [
-
         (
             interval_start_text,
             interval_end_text,
@@ -917,15 +959,14 @@ def save_interval(
             first_buy_time,
             row_updated_at,
         )
-
         for (
             token_key,
             wallet,
             first_buy_time,
+            _last_buy_time,
             row_updated_at,
-        ) in first_values
+        ) in wallet_values
     ]
-
 
     recent_flow_values = [
 
@@ -1073,28 +1114,120 @@ def save_interval(
                 )
 
 
-        # 永久first-buy表：后续买入永远不能覆盖更早时间。
-        if first_values:
-            conn.executemany(
+        # ====================================================
+        # 滚动15天 FIRST BUY
+        # first 表用于统计；last 状态只用于判断15天沉寂。
+        # ====================================================
+        new_first_count = 0
+
+        for (
+            token_key,
+            wallet,
+            first_buy_time,
+            last_buy_time,
+            row_updated_at,
+        ) in wallet_values:
+
+            existing_state = conn.execute(
                 """
-                INSERT INTO wallet_token_first_buy_v2 (
+                SELECT last_buy_time
+                FROM wallet_token_state
+                WHERE token_key = ? AND wallet = ?
+                """,
+                (token_key, wallet),
+            ).fetchone()
+
+            previous_last = (
+                existing_state[0]
+                if existing_state
+                else None
+            )
+
+            # 旧 state 和现有 first 之间可能有不到一天的切换缺口。
+            # state 缺失时，用近15天已有 first 做一次保守兜底，
+            # 只为了避免切换当天重复计数，不重算历史。
+            if previous_last is None:
+                existing_first = conn.execute(
+                    """
+                    SELECT first_buy_time
+                    FROM wallet_token_first_buy_v2
+                    WHERE token_key = ? AND wallet = ?
+                    """,
+                    (token_key, wallet),
+                ).fetchone()
+
+                if existing_first:
+                    old_first_time = existing_first[0]
+                    gap = (
+                        parse_iso(first_buy_time)
+                        - parse_iso(old_first_time)
+                    )
+                    if (
+                        gap >= timedelta(0)
+                        and gap < timedelta(days=15)
+                    ):
+                        previous_last = old_first_time
+
+            if previous_last is None:
+                is_new_first = True
+            else:
+                is_new_first = (
+                    parse_iso(first_buy_time)
+                    >= parse_iso(previous_last)
+                    + timedelta(days=15)
+                )
+
+            # 只有真正的新 FIRST BUY 才刷新 first。
+            if is_new_first:
+                conn.execute(
+                    """
+                    INSERT INTO wallet_token_first_buy_v2 (
+                        token_key,
+                        wallet,
+                        first_buy_time,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(token_key, wallet)
+                    DO UPDATE SET
+                        first_buy_time = excluded.first_buy_time,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        token_key,
+                        wallet,
+                        first_buy_time,
+                        row_updated_at,
+                    ),
+                )
+                new_first_count += 1
+
+            # 所有本区间买过的钱包都只更新隐藏 last 状态。
+            conn.execute(
+                """
+                INSERT INTO wallet_token_state (
                     token_key,
                     wallet,
-                    first_buy_time,
+                    last_buy_time,
                     updated_at
                 )
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(token_key, wallet)
                 DO UPDATE SET
-                    first_buy_time = CASE
-                        WHEN excluded.first_buy_time
-                             < wallet_token_first_buy_v2.first_buy_time
-                        THEN excluded.first_buy_time
-                        ELSE wallet_token_first_buy_v2.first_buy_time
+                    last_buy_time = CASE
+                        WHEN excluded.last_buy_time
+                             > wallet_token_state.last_buy_time
+                        THEN excluded.last_buy_time
+                        ELSE wallet_token_state.last_buy_time
                     END,
                     updated_at = excluded.updated_at
                 """,
-                first_values,
+                (
+                    token_key,
+                    wallet,
+                    last_buy_time,
+                    row_updated_at,
+                ),
             )
 
         # 资金只累计，不保存本区间明细。
@@ -1145,7 +1278,7 @@ def save_interval(
         conn.rollback()
         raise
 
-    return len(first_values), len(flow_values)
+    return new_first_count, len(flow_values)
 
 
 # =========================
@@ -1223,7 +1356,7 @@ def process_interval(
     )
 
     print(
-        f"返回：first-buy {len(first_rows):,} 行；"
+        f"返回：买入钱包聚合 {len(first_rows):,} 行；"
         f"资金 {len(flow_rows):,} Token；"
         f"{elapsed:.2f} 秒"
     )
@@ -1253,7 +1386,7 @@ def process_interval(
             )
 
         print(
-            "⚠️ first-buy达到20,000保护线，"
+            "⚠️ 买入钱包聚合达到20,000保护线，"
             "当前结果作废，按更小时间段重新补。"
         )
 
@@ -1278,7 +1411,7 @@ def process_interval(
     )
 
     print(
-        f"✅ 保存：first-buy聚合 {saved_first:,} 行；"
+        f"✅ 保存：滚动FIRST BUY {saved_first:,} 个；"
         f"资金 {saved_flow:,} Token；"
         f"checkpoint → {to_iso(end)}"
     )
