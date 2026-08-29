@@ -7,3 +7,10 @@ alpha_monitor.db-shm
 alpha_monitor.db-wal
 *.log
 .DS_Store
+
+# 本地数据和备份文件
+*.db
+*.db-*
+*.bak
+*.csv
+*.json
